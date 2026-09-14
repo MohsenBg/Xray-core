@@ -203,6 +203,35 @@ func (c *DefaultDialerClient) Close() error {
 	return nil
 }
 
+// CloseConnections closes all connections owned by this client:
+// H1 raw upload connections, idle H1/H2 transport connections, and QUIC.
+// It is only safe to call when no stream using this client is still running.
+//
+// Upstream normally keeps pooled connections alive until their timeout.
+// BGScan creates a client per IP, so connections should be released
+// immediately when the IP scan finishes.
+func (c *DefaultDialerClient) CloseConnections() error {
+	if c.uploadRawPool != nil {
+		for {
+			v := c.uploadRawPool.Get()
+			if v == nil {
+				break
+			}
+
+			switch conn := v.(type) {
+			case net.Conn:
+				_ = conn.Close()
+			}
+		}
+	}
+
+	// Close idle H1/H2 connections managed by the standard transport.
+	c.client.CloseIdleConnections()
+
+	// Close H3/QUIC connections.
+	return c.Close()
+}
+
 type WaitReadCloser struct {
 	wait   *done.Instance
 	reader atomic.Pointer[io.ReadCloser]
