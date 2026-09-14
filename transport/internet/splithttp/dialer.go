@@ -44,6 +44,46 @@ var (
 	globalDialerAccess sync.Mutex
 )
 
+// closeXmuxClientIdle releases a client's sockets as soon as its last
+// running stream ends, instead of waiting for the idle timeouts.
+func closeXmuxClientIdle(xc *XmuxClient, dc DialerClient) {
+	if xc == nil || xc.Running.Load() > 0 {
+		return
+	}
+	if d, ok := dc.(*DefaultDialerClient); ok {
+		_ = d.CloseConnections()
+	} else {
+		common.Close(xc.XmuxConn)
+	}
+}
+
+// pruneDialerMap removes one dest's manager from globalDialerMap when no
+// stream of any of its clients is running. BGScan dials each IP once, so a
+// finished entry can never be hit again; keeping it pins the whole parsed
+// config graph forever (1M IPs = 1M entries).
+func pruneDialerMap(key dialerConf) {
+	globalDialerAccess.Lock()
+	defer globalDialerAccess.Unlock()
+
+	m, ok := globalDialerMap[key]
+	if !ok {
+		return
+	}
+	for _, c := range m.xmuxClients {
+		if c.Running.Load() > 0 {
+			return
+		}
+	}
+	for _, c := range m.xmuxClients {
+		if dc, ok := c.XmuxConn.(*DefaultDialerClient); ok {
+			_ = dc.CloseConnections()
+		} else {
+			common.Close(c.XmuxConn)
+		}
+	}
+	delete(globalDialerMap, key)
+}
+
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
@@ -339,6 +379,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	requestURL.RawQuery = transportConfiguration.GetNormalizedQuery()
 
 	httpClient, xmuxClient := getHTTPClient(ctx, dest, streamSettings)
+	upKey := dialerConf{dest, streamSettings}
 
 	mode := transportConfiguration.Mode
 	if mode == "" || mode == "auto" {
@@ -359,6 +400,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	errors.LogInfo(ctx, fmt.Sprintf("XHTTP is dialing to %s, mode %s, HTTP version %s, host %s", dest, mode, httpVersion, requestURL.Host))
 
 	requestURL2 := requestURL
+	var downKey dialerConf
+	var hasDownKey bool
 	httpClient2 := httpClient
 	xmuxClient2 := xmuxClient
 	if transportConfiguration.DownloadSettings != nil {
@@ -403,6 +446,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		requestURL2.Path = config2.GetNormalizedPath()
 		requestURL2.RawQuery = config2.GetNormalizedQuery()
 		httpClient2, xmuxClient2 = getHTTPClient(ctx, dest2, memory2)
+		downKey = dialerConf{dest2, memory2}
+		hasDownKey = true
 		errors.LogInfo(ctx, fmt.Sprintf("XHTTP is downloading from %s, mode %s, HTTP version %s, host %s", dest2, "stream-down", httpVersion2, requestURL2.Host))
 	}
 
@@ -423,9 +468,15 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			}
 			if xmuxClient != nil {
 				xmuxClient.DoneRunning()
+				closeXmuxClientIdle(xmuxClient, httpClient)
+				pruneDialerMap(upKey)
 			}
 			if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
 				xmuxClient2.DoneRunning()
+				closeXmuxClientIdle(xmuxClient2, httpClient2)
+				if hasDownKey {
+					pruneDialerMap(downKey)
+				}
 			}
 		},
 	}
@@ -438,6 +489,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, false)
 		if err != nil { // browser dialer only
+			conn.onClose() // release AddRunning(), else this client never idles/closes
 			return nil, err
 		}
 		return stat.Connection(&conn), nil
@@ -447,6 +499,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(ctx, requestURL2.String(), sessionId, nil, false)
 		if err != nil { // browser dialer only
+			conn.onClose()
 			return nil, err
 		}
 	}
@@ -456,6 +509,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		_, _, _, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, true)
 		if err != nil { // browser dialer only
+			conn.onClose()
 			return nil, err
 		}
 		return stat.Connection(&conn), nil
