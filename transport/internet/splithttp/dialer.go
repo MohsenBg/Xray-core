@@ -585,3 +585,32 @@ func (w uploadWriter) Write(b []byte) (int, error) {
 	}
 	return writed, nil
 }
+
+// CloseAll closes all pooled H1/H2/QUIC transports and clears the global
+// dialer map. It is safe to call after a scan when no concurrent Dial is
+// using the global dialer map.
+func CloseAll() error {
+	globalDialerAccess.Lock()
+	defer globalDialerAccess.Unlock()
+
+	var errs []error
+
+	for _, m := range globalDialerMap {
+		for _, c := range m.xmuxClients {
+			if dc, ok := c.XmuxConn.(*DefaultDialerClient); ok {
+				// CloseConnections already ends with dc.Close() (QUIC) internally.
+				if err := dc.CloseConnections(); err != nil {
+					errs = append(errs, err)
+				}
+			} else {
+				if err := common.Close(c.XmuxConn); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+	}
+
+	globalDialerMap = make(map[dialerConf]*XmuxManager)
+
+	return errors.Combine(errs...)
+}
