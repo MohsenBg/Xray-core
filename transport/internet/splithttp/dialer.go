@@ -116,6 +116,13 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 	transportConfig := streamSettings.ProtocolSettings.(*Config)
 
 	dialContext := func(ctxInner context.Context) (net.Conn, error) {
+		// Caller ctx arrives detached (WithoutCancel in client.go) and thus
+		// uncancelable; nothing else bounds TCP+TLS/REALITY handshake here.
+		// Without this cap a stalled handshake parks goroutines forever
+		// when scanning black-hole IPs. XTLS/Xray-core#6590.
+		ctxInner, cancel := context.WithTimeout(ctxInner, 10*time.Second)
+		defer cancel()
+
 		conn, err := internet.DialSystem(ctxInner, dest, streamSettings.SocketSettings)
 		if err != nil {
 			return nil, err
