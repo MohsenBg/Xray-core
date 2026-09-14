@@ -39,13 +39,19 @@ type dialerConf struct {
 	*internet.MemoryStreamConfig
 }
 
+// Scanner-local tuning; splithttp only. Upstream's net.ConnIdleTimeout (300s)
+// assumes destinations are revisited, which a scan never does (XTLS/Xray-core#6590).
+const (
+	dialTimeout     = 10 * time.Second // TCP connect + TLS/REALITY handshake
+	idleConnTimeout = 4 * time.Second  // backstop for conns missed by CloseConnections
+)
+
 var (
 	globalDialerMap    map[dialerConf]*XmuxManager
 	globalDialerAccess sync.Mutex
 )
 
-// closeXmuxClientIdle releases a client's sockets as soon as its last
-// running stream ends, instead of waiting for the idle timeouts.
+// closeXmuxClientIdle releases a client's sockets once its last stream ends.
 func closeXmuxClientIdle(xc *XmuxClient, dc DialerClient) {
 	if xc == nil || xc.Running.Load() > 0 {
 		return
@@ -57,10 +63,8 @@ func closeXmuxClientIdle(xc *XmuxClient, dc DialerClient) {
 	}
 }
 
-// pruneDialerMap removes one dest's manager from globalDialerMap when no
-// stream of any of its clients is running. BGScan dials each IP once, so a
-// finished entry can never be hit again; keeping it pins the whole parsed
-// config graph forever (1M IPs = 1M entries).
+// pruneDialerMap forgets a finished dest's manager. A scan never revisits an
+// IP, so a kept entry pins its whole parsed config graph forever.
 func pruneDialerMap(key dialerConf) {
 	globalDialerAccess.Lock()
 	defer globalDialerAccess.Unlock()
@@ -156,11 +160,9 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 	transportConfig := streamSettings.ProtocolSettings.(*Config)
 
 	dialContext := func(ctxInner context.Context) (net.Conn, error) {
-		// Caller ctx arrives detached (WithoutCancel in client.go) and thus
-		// uncancelable; nothing else bounds TCP+TLS/REALITY handshake here.
-		// Without this cap a stalled handshake parks goroutines forever
-		// when scanning black-hole IPs. XTLS/Xray-core#6590.
-		ctxInner, cancel := context.WithTimeout(ctxInner, 10*time.Second)
+		// Caller ctx is detached (WithoutCancel) and never fires; without
+		// this cap a stalled handshake parks this goroutine forever.
+		ctxInner, cancel := context.WithTimeout(ctxInner, dialTimeout)
 		defer cancel()
 
 		conn, err := internet.DialSystem(ctxInner, dest, streamSettings.SocketSettings)
@@ -222,7 +224,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			ChromeParrot:                   !quicParams.DisableChromeParrot,
 		}
 		if quicParams.MaxIdleTimeout == 0 {
-			quicConfig.MaxIdleTimeout = net.ConnIdleTimeout
+			quicConfig.MaxIdleTimeout = idleConnTimeout
 		}
 		if quicParams.KeepAlivePeriod == 0 {
 			if keepAlivePeriod == 0 {
@@ -306,7 +308,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
 				return dialContext(ctxInner)
 			},
-			IdleConnTimeout: net.ConnIdleTimeout,
+			IdleConnTimeout: idleConnTimeout,
 			ReadIdleTimeout: keepAlivePeriod,
 		}
 	} else {
@@ -317,7 +319,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		transport = &http.Transport{
 			DialTLSContext:  httpDialContext,
 			DialContext:     httpDialContext,
-			IdleConnTimeout: net.ConnIdleTimeout,
+			IdleConnTimeout: idleConnTimeout,
 			// chunked transfer download with KeepAlives is buggy with
 			// http.Client and our custom dial context.
 			DisableKeepAlives: true,
