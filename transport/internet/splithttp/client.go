@@ -61,7 +61,16 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 	if body != nil {
 		method = c.transportConfig.GetNormalizedUplinkHTTPMethod() // stream-up/one
 	}
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
+
+	reqCtx, cancelRequest := context.WithCancel(context.WithoutCancel(ctx))
+	isConnectionEstablished := false
+	defer func() {
+		if !isConnectionEstablished {
+			cancelRequest()
+		}
+	}()
+
+	req, err := http.NewRequestWithContext(reqCtx, method, url, body)
 	if err != nil {
 		errors.LogInfoInner(ctx, err, "failed to create HTTP request for "+url)
 		return nil, nil, nil, err
@@ -94,7 +103,14 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 		wrc.(*WaitReadCloser).Set(resp.Body)
 	}()
 
-	<-gotConn.Wait()
+	select {
+	case <-gotConn.Wait():
+	case <-ctx.Done():
+		cancelRequest()
+		<-gotConn.Wait()
+		return nil, nil, nil, errors.New("dial canceled").Base(ctx.Err())
+	}
+	isConnectionEstablished = true
 	return
 }
 
