@@ -39,8 +39,14 @@ type dialerConf struct {
 	*internet.MemoryStreamConfig
 }
 
-// Scanner-local tuning; splithttp only. Upstream's net.ConnIdleTimeout (300s)
-// assumes destinations are revisited, which a scan never does (XTLS/Xray-core#6590).
+// Did you really come here to read my patch? Stupid patch 😂
+// At this point, I don't even know what the fuck I'm doing lol.
+//
+// Check all the stuff linked below:
+// https://github.com/XTLS/Xray-core/issues/6590
+
+// Scanner-local splithttp tuning.
+// Upstream's net.ConnIdleTimeout is 300s, which is really bad for a scanner, right?
 const (
 	dialTimeout     = 10 * time.Second // TCP connect + TLS/REALITY handshake
 	idleConnTimeout = 4 * time.Second  // backstop for conns missed by CloseConnections
