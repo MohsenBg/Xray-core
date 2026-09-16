@@ -43,6 +43,13 @@ func init() {
 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
 }
 
+// wsTLSHandshakeTimeout bounds the uTLS handshake inside NetDialTLSContext.
+// Gorilla's HandshakeTimeout cannot apply there because the custom dialer
+// ignores the passed ctx and uses the outer dial ctx, which never fires on
+// instance Close. Without this cap a missing ServerHello (SNI blackhole)
+// parks the handshake reader + interrupter goroutines forever.
+const wsTLSHandshakeTimeout = 8 * time.Second
+
 func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig, ed []byte) (net.Conn, error) {
 	wsSettings := streamSettings.ProtocolSettings.(*Config)
 
@@ -94,15 +101,23 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
 					pconn = newConn
 				}
 
-				// TLS and apply the handshake
+				release := internet.TrackDial(pconn)
+				defer release()
+
+				// TLS and apply the handshake, bounded: on timeout uTLS's
+				// interrupter closes pconn so no goroutine is parked.
+				hsCtx, cancel := context.WithTimeout(ctx, wsTLSHandshakeTimeout)
+				defer cancel()
 				cn := tls.UClient(pconn, tlsConfig, fingerprint).(*tls.UConn)
-				if err := cn.WebsocketHandshakeContext(ctx); err != nil {
+				if err := cn.WebsocketHandshakeContext(hsCtx); err != nil {
 					errors.LogErrorInner(ctx, err, "failed to dial to "+addr)
+					pconn.Close()
 					return nil, err
 				}
 				if !tlsConfig.InsecureSkipVerify {
 					if err := cn.VerifyHostname(tlsConfig.ServerName); err != nil {
 						errors.LogErrorInner(ctx, err, "failed to dial to "+addr)
+						pconn.Close()
 						return nil, err
 					}
 				}

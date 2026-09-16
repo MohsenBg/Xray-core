@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -15,6 +16,11 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
+
+// httpUpgradeTLSHandshakeTimeout bounds the uTLS handshake below. The outer
+// dial ctx never fires on instance Close, so without this cap a missing
+// ServerHello parks the handshake reader + interrupter goroutines forever.
+const httpUpgradeTLSHandshakeTimeout = 8 * time.Second
 
 type ConnRF struct {
 	net.Conn
@@ -68,7 +74,12 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
 		tlsConfig := tConfig.GetTLSConfig(tls.WithDestination(dest), tls.WithNextProto("http/1.1"))
 		if fingerprint := tls.GetFingerprint(tConfig.Fingerprint); fingerprint != nil {
 			conn = tls.UClient(pconn, tlsConfig, fingerprint)
-			if err := conn.(*tls.UConn).WebsocketHandshakeContext(ctx); err != nil {
+			release := internet.TrackDial(pconn)
+			defer release()
+			hsCtx, cancel := context.WithTimeout(ctx, httpUpgradeTLSHandshakeTimeout)
+			defer cancel()
+			if err := conn.(*tls.UConn).WebsocketHandshakeContext(hsCtx); err != nil {
+				pconn.Close()
 				return nil, err
 			}
 		} else {

@@ -5,6 +5,7 @@ import (
 	gotls "crypto/tls"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -15,6 +16,11 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
+
+// tcpTLSHandshakeTimeout bounds the TLS handshake below. The outer dial ctx
+// never fires on instance Close, so without this cap a missing ServerHello
+// parks the handshake reader + interrupter goroutines forever.
+const tcpTLSHandshakeTimeout = 8 * time.Second
 
 // Dial dials a new TCP connection to the given destination.
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
@@ -75,16 +81,25 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		if fingerprint := tls.GetFingerprint(config.Fingerprint); fingerprint != nil {
 			conn = tls.UClient(conn, tlsConfig, fingerprint)
+			release := internet.TrackDial(conn)
+			defer release()
+			hsCtx, cancel := context.WithTimeout(ctx, tcpTLSHandshakeTimeout)
+			defer cancel()
 			if len(tlsConfig.NextProtos) == 1 && tlsConfig.NextProtos[0] == "http/1.1" { // allow manually specify
-				err = conn.(*tls.UConn).WebsocketHandshakeContext(ctx)
+				err = conn.(*tls.UConn).WebsocketHandshakeContext(hsCtx)
 			} else {
-				err = conn.(*tls.UConn).HandshakeContext(ctx)
+				err = conn.(*tls.UConn).HandshakeContext(hsCtx)
 			}
 		} else {
 			conn = tls.Client(conn, tlsConfig)
-			err = conn.(*tls.Conn).HandshakeContext(ctx)
+			release := internet.TrackDial(conn)
+			defer release()
+			hsCtx, cancel := context.WithTimeout(ctx, tcpTLSHandshakeTimeout)
+			defer cancel()
+			err = conn.(*tls.Conn).HandshakeContext(hsCtx)
 		}
 		if err != nil {
+			conn.Close()
 			if isFromMitmVerify {
 				return nil, errors.New("MITM freedom RAW TLS: failed to verify Domain Fronting certificate from " + mitmServerName).Base(err).AtWarning()
 			}
