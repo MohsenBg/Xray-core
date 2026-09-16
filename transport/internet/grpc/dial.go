@@ -206,6 +206,25 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 	return conn, err
 }
 
+// CloseAll closes all pooled gRPC clients and clears the global dialer map.
+// A scan never revisits a destination, so a kept entry pins its whole
+// parsed config graph plus an HTTP/2 transport forever. Safe to call when
+// no concurrent Dial is using the map (e.g. scan-end cleanup).
+func CloseAll() error {
+	globalDialerAccess.Lock()
+	defer globalDialerAccess.Unlock()
+
+	var errs []error
+	for _, c := range globalDialerMap {
+		if err := c.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	globalDialerMap = make(map[dialerConf]*grpc.ClientConn)
+
+	return errors.Combine(errs...)
+}
+
 // setUserAgent overrides the user-agent on a ClientConn to remove the
 // "grpc-go/version" suffix that grpc.WithUserAgent unconditionally appends.
 func setUserAgent(conn *grpc.ClientConn, ua string) {
