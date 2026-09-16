@@ -18,6 +18,43 @@ var (
 	effectiveSystemDialer SystemDialer = &DefaultSystemDialer{}
 )
 
+// SystemDialTimeout limits how long a TCP connect can block.
+// The upstream default is 16s, which is too long for scanning:
+// dead IPs can hold a connection and goroutine until the timeout.
+var SystemDialTimeout = 8 * time.Second
+
+// MaxConcurrentDials caps concurrent system dials process-wide. Excess
+// dials wait on ctx (cheap: no socket, no buffers) instead of parking
+// kernel sockets. Zero (upstream default) means unlimited.
+var MaxConcurrentDials = 0
+
+var (
+	dialSemMu sync.Mutex
+	dialSem   chan struct{}
+)
+
+// acquireDialSlot waits for a dial slot when MaxConcurrentDials > 0.
+// The returned release func must be called once the dial returns.
+func acquireDialSlot(ctx context.Context) (release func(), err error) {
+	dialSemMu.Lock()
+	n := MaxConcurrentDials
+	if n <= 0 {
+		dialSemMu.Unlock()
+		return func() {}, nil
+	}
+	if dialSem == nil || cap(dialSem) != n {
+		dialSem = make(chan struct{}, n)
+	}
+	sem := dialSem
+	dialSemMu.Unlock()
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 type SystemDialer interface {
 	Dial(ctx context.Context, source net.Address, destination net.Destination, sockopt *SocketConfig) (net.Conn, error)
 	DestIpAddress() net.IP
@@ -115,7 +152,7 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		}
 	}
 	dialer := &net.Dialer{
-		Timeout:         time.Second * 16,
+		Timeout:         SystemDialTimeout,
 		LocalAddr:       resolveSrcAddr(dest.Network, src),
 		KeepAlive:       keepAlive,
 		KeepAliveConfig: keepAliveConfig,
@@ -140,6 +177,13 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 			})
 		}
 	}
+
+	// Roof on concurrent dials: waiting here holds no socket.
+	releaseDial, err := acquireDialSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseDial()
 
 	return dialer.DialContext(ctx, dest.Network.SystemString(), dest.NetAddr())
 }
