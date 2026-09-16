@@ -28,6 +28,11 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
+// DialMaxAttempts caps outbound dial attempts per dispatch (delays between
+// attempts are 0ms, 200ms, 400ms, ... — see retry.ExponentialBackoff).
+// Upstream default is 5; scanners usually want fewer.
+var DialMaxAttempts = 5
+
 // Handler is an outbound connection handler for VMess protocol.
 type Handler struct {
 	server        *protocol.ServerSpec
@@ -68,7 +73,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	rec := h.server
 	var conn stat.Connection
 
-	err := retry.ExponentialBackoff(5, 200).On(func() error {
+	err := retry.ExponentialBackoff(DialMaxAttempts, 200).On(func() error {
 		rawConn, err := dialer.Dial(ctx, rec.Destination)
 		if err != nil {
 			return err

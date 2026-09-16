@@ -48,6 +48,11 @@ func init() {
 	}))
 }
 
+// DialMaxAttempts caps outbound dial attempts per dispatch (delays between
+// attempts are 0ms, 200ms, 400ms, ... — see retry.ExponentialBackoff).
+// Upstream default is 5; scanners usually want fewer.
+var DialMaxAttempts = 5
+
 // Handler is an outbound connection handler for VLess protocol.
 type Handler struct {
 	server        *protocol.ServerSpec
@@ -189,7 +194,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	if conn == nil {
-		if err := retry.ExponentialBackoff(5, 200).On(func() error {
+		if err := retry.ExponentialBackoff(DialMaxAttempts, 200).On(func() error {
 			var err error
 			conn, err = dialer.Dial(ctx, rec.Destination)
 			if err != nil {
